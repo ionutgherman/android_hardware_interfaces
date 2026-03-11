@@ -16,10 +16,9 @@
 
 #pragma once
 
-#include <aidl/android/hardware/audio/effect/BnEffect.h>
-#include <fmq/AidlMessageQueue.h>
 #include <hardware/audio_effect.h>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "effect-impl/EffectImpl.h"
@@ -38,6 +37,7 @@ class ViperEffectContext final : public EffectContext {
         mParams = params;
         return RetCode::SUCCESS;
     }
+
     std::vector<uint8_t> getParams(std::vector<uint8_t> id __unused) const { return mParams; }
 
   private:
