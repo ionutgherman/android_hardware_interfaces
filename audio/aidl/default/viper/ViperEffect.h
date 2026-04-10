@@ -38,7 +38,9 @@ class ViperEffectContext final : public EffectContext {
         return RetCode::SUCCESS;
     }
 
-    std::vector<uint8_t> getParams(std::vector<uint8_t> id __unused) const { return mParams; }
+    std::vector<uint8_t> getParams(const std::vector<uint8_t>& id __unused) const {
+        return mParams;
+    }
 
   private:
     std::vector<uint8_t> mParams;
@@ -49,6 +51,10 @@ class ViperEffect final : public EffectImpl {
   public:
     static const std::string kEffectName;
     static const Descriptor kDescriptor;
+
+    static constexpr uint32_t kDefaultFrameCount = 256;
+    static constexpr uint32_t kDefaultSampleRate = 48000;
+    static constexpr uint32_t kMaxGetParamReplySize = 4096;
 
     ViperEffect();
     ~ViperEffect();
@@ -70,6 +76,7 @@ class ViperEffect final : public EffectImpl {
   private:
     bool loadLegacyLibrary();
     void unloadLegacyLibrary();
+    bool initLegacyEffect(const Parameter::Common& common) REQUIRES(mImplMutex);
 
     std::shared_ptr<ViperEffectContext> mContext GUARDED_BY(mImplMutex);
     void* mLibHandle = nullptr;

@@ -14,13 +14,13 @@
  * limitations under the License.
  */
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <dlfcn.h>
 #include <memory>
 #include <optional>
-#include <unordered_set>
+#include <vector>
 
 #include <aidl/android/hardware/audio/effect/DefaultExtension.h>
 #define LOG_TAG "AHAL_ViperEffect"
@@ -92,9 +92,7 @@ const Descriptor ViperEffect::kDescriptor = {
                    .name = ViperEffect::kEffectName,
                    .implementor = "ViPER Team"}};
 
-ViperEffect::ViperEffect() {
-    loadLegacyLibrary();
-}
+ViperEffect::ViperEffect() {}
 
 ViperEffect::~ViperEffect() {
     cleanUp();
@@ -103,7 +101,7 @@ ViperEffect::~ViperEffect() {
 
 bool ViperEffect::loadLegacyLibrary() {
     for (const char* path : kViperLibPaths) {
-        mLibHandle = dlopen(path, RTLD_NOW);
+        mLibHandle = dlopen(path, RTLD_LAZY);
         if (mLibHandle) {
             LOG(INFO) << __func__ << " loaded legacy library from " << path;
             break;
@@ -148,6 +146,86 @@ void ViperEffect::unloadLegacyLibrary() {
     }
 }
 
+bool ViperEffect::initLegacyEffect(const Parameter::Common& common) REQUIRES(mImplMutex) {
+    if (!mLibrary || mLegacyHandle) {
+        return mLegacyHandle != nullptr;
+    }
+
+    int32_t sessionId = common.session;
+    int32_t ioId = common.ioHandle;
+
+    int ret = mLibrary->create_effect(&kViperLegacyImplUuid, sessionId, ioId, &mLegacyHandle);
+    if (ret != 0 || !mLegacyHandle) {
+        LOG(ERROR) << __func__ << " create_effect failed, ret=" << ret
+                   << " session=" << sessionId << " ioId=" << ioId;
+        mLegacyHandle = nullptr;
+        return false;
+    }
+
+    LOG(INFO) << __func__ << " created legacy effect handle";
+    if (mContext) {
+        mContext->setLegacyHandle(mLegacyHandle);
+    }
+
+    effect_config_t config = {};
+
+    config.inputCfg.samplingRate =
+            common.input.base.sampleRate > 0 ? common.input.base.sampleRate : kDefaultSampleRate;
+    config.inputCfg.channels = AUDIO_CHANNEL_OUT_STEREO;
+    config.inputCfg.format = AUDIO_FORMAT_PCM_FLOAT;
+    config.inputCfg.accessMode = EFFECT_BUFFER_ACCESS_READ;
+    config.inputCfg.mask = EFFECT_CONFIG_ALL;
+    config.inputCfg.buffer.frameCount =
+            common.input.frameCount > 0 ? static_cast<uint32_t>(common.input.frameCount)
+                                        : kDefaultFrameCount;
+
+    config.outputCfg.samplingRate =
+            common.output.base.sampleRate > 0 ? common.output.base.sampleRate
+                                              : config.inputCfg.samplingRate;
+    config.outputCfg.channels = AUDIO_CHANNEL_OUT_STEREO;
+    config.outputCfg.format = AUDIO_FORMAT_PCM_FLOAT;
+    config.outputCfg.accessMode = EFFECT_BUFFER_ACCESS_WRITE;
+    config.outputCfg.mask = EFFECT_CONFIG_ALL;
+    config.outputCfg.buffer.frameCount =
+            common.output.frameCount > 0 ? static_cast<uint32_t>(common.output.frameCount)
+                                         : config.inputCfg.buffer.frameCount;
+
+    uint32_t replySize = sizeof(int32_t);
+    int32_t reply = 0;
+
+    int status = (*mLegacyHandle)->command(
+            mLegacyHandle,
+            EFFECT_CMD_SET_CONFIG,
+            sizeof(config),
+            &config,
+            &replySize,
+            &reply);
+
+    if (status != 0 || reply != 0) {
+        LOG(ERROR) << __func__ << " SET_CONFIG failed, status=" << status
+                   << " reply=" << reply;
+    }
+
+    replySize = sizeof(int32_t);
+    reply = 0;
+    status = (*mLegacyHandle)->command(
+            mLegacyHandle,
+            EFFECT_CMD_ENABLE,
+            0,
+            nullptr,
+            &replySize,
+            &reply);
+
+    if (status == 0 && reply == 0) {
+        mLegacyEnabled = true;
+    } else {
+        LOG(ERROR) << __func__ << " ENABLE failed, status=" << status
+                   << " reply=" << reply;
+    }
+
+    return true;
+}
+
 ndk::ScopedAStatus ViperEffect::getDescriptor(Descriptor* aidlReturn) {
     if (!aidlReturn) {
         return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_ARGUMENT);
@@ -169,71 +247,7 @@ ndk::ScopedAStatus ViperEffect::setParameterSpecific(const Parameter::Specific& 
     RETURN_IF(!defaultExt.has_value(), EX_ILLEGAL_ARGUMENT, "parcelableNull");
 
     if (!mLegacyHandle && mLibrary) {
-        const auto& common = mContext->getCommon();
-        int32_t sessionId = common.session;
-        int32_t ioId = common.ioHandle;
-
-        int ret = mLibrary->create_effect(&kViperLegacyImplUuid, sessionId, ioId, &mLegacyHandle);
-        if (ret == 0 && mLegacyHandle) {
-            mContext->setLegacyHandle(mLegacyHandle);
-
-            effect_config_t config = {};
-            config.inputCfg.samplingRate =
-                    common.input.base.sampleRate > 0 ? common.input.base.sampleRate : 48000;
-            config.inputCfg.channels = AUDIO_CHANNEL_OUT_STEREO;
-            config.inputCfg.format = AUDIO_FORMAT_PCM_FLOAT;
-            config.inputCfg.accessMode = EFFECT_BUFFER_ACCESS_READ;
-            config.inputCfg.mask = EFFECT_CONFIG_ALL;
-            config.inputCfg.buffer.frameCount =
-                    common.input.frameCount > 0 ? static_cast<uint32_t>(common.input.frameCount)
-                                                : 256;
-
-            config.outputCfg.samplingRate =
-                    common.output.base.sampleRate > 0 ? common.output.base.sampleRate
-                                                      : config.inputCfg.samplingRate;
-            config.outputCfg.channels = AUDIO_CHANNEL_OUT_STEREO;
-            config.outputCfg.format = AUDIO_FORMAT_PCM_FLOAT;
-            config.outputCfg.accessMode = EFFECT_BUFFER_ACCESS_WRITE;
-            config.outputCfg.mask = EFFECT_CONFIG_ALL;
-            config.outputCfg.buffer.frameCount =
-                    common.output.frameCount > 0
-                            ? static_cast<uint32_t>(common.output.frameCount)
-                            : config.inputCfg.buffer.frameCount;
-
-            uint32_t replySize = sizeof(int32_t);
-            int32_t reply = 0;
-
-            int status = (*mLegacyHandle)->command(
-                    mLegacyHandle,
-                    EFFECT_CMD_SET_CONFIG,
-                    sizeof(config),
-                    &config,
-                    &replySize,
-                    &reply);
-            if (status != 0 || reply != 0) {
-                LOG(ERROR) << __func__ << " lazy SET_CONFIG failed, status=" << status
-                           << " reply=" << reply;
-            }
-
-            replySize = sizeof(int32_t);
-            reply = 0;
-            status = (*mLegacyHandle)->command(
-                    mLegacyHandle,
-                    EFFECT_CMD_ENABLE,
-                    0,
-                    nullptr,
-                    &replySize,
-                    &reply);
-            if (status == 0 && reply == 0) {
-                mLegacyEnabled = true;
-            } else {
-                LOG(ERROR) << __func__ << " lazy ENABLE failed, status=" << status
-                           << " reply=" << reply;
-            }
-        } else {
-            LOG(ERROR) << __func__ << " lazy create_effect failed, ret=" << ret
-                       << " session=" << sessionId << " ioId=" << ioId;
-        }
+        initLegacyEffect(mContext->getCommon());
     }
 
     if (mLegacyHandle && !defaultExt->bytes.empty()) {
@@ -252,6 +266,8 @@ ndk::ScopedAStatus ViperEffect::setParameterSpecific(const Parameter::Specific& 
             LOG(ERROR) << __func__ << " legacy SET_PARAM failed, status=" << status
                        << " reply=" << reply << " bytes=" << defaultExt->bytes.size();
         }
+
+        return ndk::ScopedAStatus::ok();
     }
 
     RETURN_IF(mContext->setParams(defaultExt->bytes) != RetCode::SUCCESS, EX_ILLEGAL_ARGUMENT,
@@ -278,24 +294,31 @@ ndk::ScopedAStatus ViperEffect::getParameterSpecific(const Parameter::Id& id,
     DefaultExtension defaultExt;
 
     if (mLegacyHandle) {
-        defaultExt.bytes = defaultIdExt->bytes;
-
-        uint32_t replySize = static_cast<uint32_t>(defaultExt.bytes.size());
+        const uint32_t cmdSize = static_cast<uint32_t>(defaultIdExt->bytes.size());
+        std::vector<uint8_t> replyBuf(kMaxGetParamReplySize);
+        uint32_t replySize = kMaxGetParamReplySize;
 
         int status = (*mLegacyHandle)->command(
                 mLegacyHandle,
                 EFFECT_CMD_GET_PARAM,
-                static_cast<uint32_t>(defaultExt.bytes.size()),
-                defaultExt.bytes.data(),
+                cmdSize,
+                defaultIdExt->bytes.data(),
                 &replySize,
-                defaultExt.bytes.data());
-
-        defaultExt.bytes.resize(replySize);
+                replyBuf.data());
 
         if (status != 0) {
             LOG(ERROR) << __func__ << " legacy GET_PARAM failed, status=" << status
                        << " replySize=" << replySize;
         }
+
+        if (replySize > kMaxGetParamReplySize) {
+            LOG(WARNING) << __func__ << " legacy GET_PARAM reply truncated from "
+                         << replySize << " to " << kMaxGetParamReplySize;
+            replySize = kMaxGetParamReplySize;
+        }
+
+        replyBuf.resize(replySize);
+        defaultExt.bytes = std::move(replyBuf);
     } else {
         defaultExt.bytes = mContext ? mContext->getParams(defaultIdExt->bytes)
                                     : defaultIdExt->bytes;
@@ -316,78 +339,11 @@ std::shared_ptr<EffectContext> ViperEffect::createContext(const Parameter::Commo
 
     mContext = std::make_shared<ViperEffectContext>(1, common);
 
-    if (mLibrary && !mLegacyHandle) {
-        int32_t sessionId = common.session;
-        int32_t ioId = common.ioHandle;
-
-        int ret = mLibrary->create_effect(&kViperLegacyImplUuid, sessionId, ioId, &mLegacyHandle);
-        if (ret != 0 || !mLegacyHandle) {
-            LOG(ERROR) << __func__ << " failed to create legacy effect, ret=" << ret
-                       << " session=" << sessionId << " ioId=" << ioId;
-            mLegacyHandle = nullptr;
-            return mContext;
-        }
-
-        LOG(INFO) << __func__ << " created legacy effect handle";
-        mContext->setLegacyHandle(mLegacyHandle);
-
-        effect_config_t config = {};
-
-        config.inputCfg.samplingRate =
-                common.input.base.sampleRate > 0 ? common.input.base.sampleRate : 48000;
-        config.inputCfg.channels = AUDIO_CHANNEL_OUT_STEREO;
-        config.inputCfg.format = AUDIO_FORMAT_PCM_FLOAT;
-        config.inputCfg.accessMode = EFFECT_BUFFER_ACCESS_READ;
-        config.inputCfg.mask = EFFECT_CONFIG_ALL;
-        config.inputCfg.buffer.frameCount =
-                common.input.frameCount > 0 ? static_cast<uint32_t>(common.input.frameCount)
-                                            : 256;
-
-        config.outputCfg.samplingRate =
-                common.output.base.sampleRate > 0 ? common.output.base.sampleRate
-                                                  : config.inputCfg.samplingRate;
-        config.outputCfg.channels = AUDIO_CHANNEL_OUT_STEREO;
-        config.outputCfg.format = AUDIO_FORMAT_PCM_FLOAT;
-        config.outputCfg.accessMode = EFFECT_BUFFER_ACCESS_WRITE;
-        config.outputCfg.mask = EFFECT_CONFIG_ALL;
-        config.outputCfg.buffer.frameCount =
-                common.output.frameCount > 0 ? static_cast<uint32_t>(common.output.frameCount)
-                                             : config.inputCfg.buffer.frameCount;
-
-            uint32_t replySize = sizeof(int32_t);
-            int32_t reply = 0;
-
-        int status = (*mLegacyHandle)->command(
-                mLegacyHandle,
-                EFFECT_CMD_SET_CONFIG,
-                sizeof(config),
-                &config,
-                &replySize,
-                &reply);
-
-        if (status != 0 || reply != 0) {
-            LOG(ERROR) << __func__ << " legacy SET_CONFIG failed, status=" << status
-                       << " reply=" << reply;
-            return mContext;
-        }
-
-        replySize = sizeof(int32_t);
-        reply = 0;
-        status = (*mLegacyHandle)->command(
-                mLegacyHandle,
-                EFFECT_CMD_ENABLE,
-                0,
-                nullptr,
-                &replySize,
-                &reply);
-
-        if (status == 0 && reply == 0) {
-            mLegacyEnabled = true;
-        } else {
-            LOG(ERROR) << __func__ << " legacy ENABLE failed, status=" << status
-                       << " reply=" << reply;
-        }
+    if (!mLibHandle) {
+        loadLegacyLibrary();
     }
+
+    initLegacyEffect(common);
 
     return mContext;
 }
@@ -430,8 +386,7 @@ IEffect::Status ViperEffect::effectProcessImpl(float* in, float* out, int sample
         LOG(WARNING) << __func__ << " legacy process returned " << ret;
     }
 
-    std::copy(in, in + samples, out);
+    std::memcpy(out, in, static_cast<size_t>(samples) * sizeof(float));
     return {STATUS_OK, samples, samples};
 }
-
 }  // namespace aidl::android::hardware::audio::effect
